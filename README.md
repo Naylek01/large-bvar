@@ -39,15 +39,7 @@ All models use the same 20-variable VAR(4), but differ in their prior/covariance
 
 The NCP error-dynamics branch is nested as
 
-$$
-\text{BVAR-NCP}
-\longrightarrow
-\text{BVAR-CSV}
-\longrightarrow
-\text{BVAR-CSV-t}
-\longrightarrow
-\text{BVAR-CSV-t-MA}.
-$$
+`BVAR-NCP` → `BVAR-CSV` → `BVAR-CSV-t` → `BVAR-CSV-t-MA`.
 
 Minnesota, IP, and SSVS are separate prior/covariance branches; they are not obtained by switching off CSV, Student-t, or MA states.
 
@@ -57,22 +49,22 @@ Minnesota, IP, and SSVS are separate prior/covariance branches; they are not obt
 
 The common reduced-form model is
 
-$$
+```math
 y_t = c + B_1 y_{t-1} + \cdots + B_p y_{t-p} + u_t,
 \qquad p=4.
-$$
+```
 
 With 20 variables, each equation has
 
-$$
+```math
 k = 1 + np = 1 + 20\times 4 = 81
-$$
+```
 
 regressors, for a total of
 
-$$
+```math
 20\times 81 = 1620
-$$
+```
 
 VAR coefficients.
 
@@ -82,36 +74,36 @@ For `BVAR-Minn`, the coefficient prior follows the Minnesota construction used i
 
 For an own lag at lag $\ell$,
 
-$$
-\operatorname{Var}(B_{ii,\ell}) = \frac{c_1}{\ell^2}.
-$$
+```math
+\mathrm{Var}(B_{ii,\ell}) = \frac{c_1}{\ell^2}.
+```
 
 For a cross lag,
 
-$$
-\operatorname{Var}(B_{ij,\ell})
+```math
+\mathrm{Var}(B_{ij,\ell})
 =
 \frac{c_2\,\sigma_i^2}{\ell^2\sigma_j^2},
 \qquad i\neq j.
-$$
+```
 
 The intercept variance is $c_3$. The Chan settings used here are
 
-$$
+```math
 c_1=0.2^2,\qquad c_2=0.1^2,\qquad c_3=100.
-$$
+```
 
 ### Natural-conjugate prior
 
 `BVAR-NCP` and the CSV / Student-t / MA extensions use
 
-$$
+```math
 A\mid\Sigma \sim MN(A_0,V_A,\Sigma),
-$$
+```
 
-$$
+```math
 \Sigma \sim IW(\nu_0,S_0).
-$$
+```
 
 The notebook reproduces the hyperparameter construction in `prior_NC.m`, including $A_0=0$, lag shrinkage based on univariate AR residual variances, and $\nu_0=n+3$.
 
@@ -119,13 +111,13 @@ The notebook reproduces the hyperparameter construction in `prior_NC.m`, includi
 
 `BVAR-IP` separates the coefficient prior from the residual covariance prior:
 
-$$
+```math
 \beta \sim N(\beta_0,V_\beta),
-$$
+```
 
-$$
+```math
 \Sigma \sim IW(\nu_0,S_0).
-$$
+```
 
 Because the coefficient prior is independent of $\Sigma$, the model is sampled with Gibbs steps rather than the natural-conjugate direct draw.
 
@@ -133,21 +125,21 @@ Because the coefficient prior is independent of $\Sigma$, the model is sampled w
 
 `BVAR-SSVS` adds one latent inclusion indicator to each coefficient. Conditional on $\gamma_j$,
 
-$$
-\beta_j\mid \gamma_j=0 \sim N\!\left(0,V_j^{\text{Minn}}\right),
-$$
+```math
+\beta_j\mid \gamma_j=0 \sim N\!\left(0,V_j^{\mathrm{Minn}}\right),
+```
 
-$$
+```math
 \beta_j\mid \gamma_j=1 \sim N(0,\kappa_1),
-$$
+```
 
 with
 
-$$
-\gamma_j\sim \operatorname{Bernoulli}(q),
+```math
+\gamma_j\sim \mathrm{Bernoulli}(q),
 \qquad q=0.5,
 \qquad \kappa_1=10.
-$$
+```
 
 The notebook retains `gamma_share`, the fraction of coefficients in the less-shrunk slab state.
 
@@ -155,33 +147,33 @@ The notebook retains `gamma_share`, the fraction of coefficients in the less-shr
 
 The richest specification, `BVAR-CSV-t-MA`, writes the reduced-form innovation as
 
-$$
+```math
 u_t = e_t + \psi e_{t-1}.
-$$
+```
 
 Conditional on the common volatility state and Student-t scale mixture,
 
-$$
+```math
 e_t\mid h_t,\lambda_t,\Sigma
 \sim
 N\!\left(0,\lambda_t e^{h_t}\Sigma\right).
-$$
+```
 
 The common stochastic-volatility state follows
 
-$$
+```math
 h_t = \rho h_{t-1}+\eta_t,
-$$
+```
 
-$$
+```math
 \eta_t\sim N(0,\sigma_h^2).
-$$
+```
 
 Student-t innovations are represented through
 
-$$
+```math
 \lambda_t\sim IG\!\left(\frac{\nu}{2},\frac{\nu}{2}\right).
-$$
+```
 
 The generalized engine switches these components off literally:
 
@@ -233,7 +225,7 @@ The function reuses the posterior draws already stored by `fit_bvar`; it does **
 
 For every posterior draw, the forecast engine recursively simulates future observations and feeds simulated values back into the lag vector. The predictive density is aggregated over posterior draws with the log-mean-exp identity:
 
-$$
+```math
 \log p(y_{T+h}\mid Y_T)
 =
 \log\left[
@@ -241,13 +233,13 @@ $$
 \sum_{s=1}^{S}
 p(y_{T+h}\mid\theta^{(s)},Y_T)
 \right].
-$$
+```
 
 For the MA(1) specification, the innovation state is propagated recursively. The same MA filter is explicitly inverted in the historical decomposition:
 
-$$
+```math
 e_t = u_t-\psi e_{t-1}.
-$$
+```
 
 ## Structural analysis
 
@@ -283,25 +275,25 @@ The evaluation focuses on the four core variables used in the replication:
 
 Point forecasts are compared with RMSFE,
 
-$$
-\operatorname{RMSFE}
+```math
+\mathrm{RMSFE}
 =
 \sqrt{
 \frac{1}{M}
 \sum_{m=1}^{M}
 \left(y_m-\widehat y_m\right)^2
 },
-$$
+```
 
 while density forecasts are compared with average log predictive likelihood,
 
-$$
-\operatorname{ALPL}
+```math
+\mathrm{ALPL}
 =
 \frac{1}{M}
 \sum_{m=1}^{M}
 \log p(y_m\mid\mathcal I_{m-1}).
-$$
+```
 
 Lower RMSFE is better; higher ALPL is better.
 
