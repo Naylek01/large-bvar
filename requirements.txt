@@ -2,6 +2,7 @@
 numpy>=1.26,<3
 scipy>=1.12,<2
 pandas>=2.2,<3
+threadpoolctl>=3.5,<4
 
 # Excel files used by the Chan (2020) replication
 openpyxl>=3.1,<4
@@ -10,6 +11,7 @@ xlrd>=2.0,<3
 # Plotting
 matplotlib>=3.8,<4
 
-# Notebook execution
+# Notebook execution and HTML export
 ipykernel>=6.29,<8
 jupyterlab>=4,<5
+nbconvert>=7.16,<8

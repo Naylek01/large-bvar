@@ -483,6 +483,45 @@ def plot_model_comparison(comparison: pd.DataFrame, metric: str = "RMSFE", horiz
     return fig
 
 
+def display_recursive_suite(suite, detail_model: Optional[str] = None):
+    """Compact notebook display for ``run_large_bvar_suite`` output."""
+    from IPython.display import Markdown, display
+
+    print("Evaluation: lower RMSFE is better; higher ALPL is better.")
+    for title, table in suite["tables"].items():
+        print(f"\
+{title}")
+        display(table.round(4))
+
+    print("\
+Best model by evaluation task")
+    display(suite["best_by_task"].round(4))
+    for comment in suite["comments"]:
+        display(Markdown(comment))
+
+    comparison = suite["comparison"]
+    for metric in ("RMSFE", "ALPL"):
+        for horizon in ("Nowcast", "1-quarter-ahead"):
+            plot_model_comparison(comparison, metric=metric, horizon=horizon)
+            plt.show()
+
+    if detail_model is not None:
+        replications = suite["replications"]
+        if detail_model not in replications:
+            raise KeyError(
+                f"detail_model={detail_model!r} is not one of {list(replications)}"
+            )
+        result = replications[detail_model]
+        print(f"\
+Detailed recursive paths — {detail_model}")
+        plot_forecasts(result, horizon=0); plt.show()
+        plot_forecasts(result, horizon=1); plt.show()
+        plot_forecast_errors(result, horizon=0); plt.show()
+        plot_forecast_errors(result, horizon=1); plt.show()
+
+    return suite
+
+
 # -----------------------------------------------------------------------------
 # Large-BVAR posterior coefficients, predictive fans and structural analysis
 # -----------------------------------------------------------------------------
@@ -543,9 +582,11 @@ def plot_coefficient_marginals(fit, indices=None):
 
 
 def plot_forecast_fan(forecast, indices=None, last_obs=72, quantiles=(10, 25, 50, 75, 90)):
-    """Posterior predictive fan charts from ``forecast_paths_from_fit``.
+    """Posterior predictive fan chart from ``forecast_bvar(...)["fan"]``.
 
-    By default every fitted variable is shown.  The bands are P10-P90 and
+    The same dictionary is also returned by the low-level
+    ``forecast_paths_from_fit`` helper. By default every fitted variable is shown.
+    The bands are P10-P90 and
     P25-P75 with the posterior median in the center.
     """
     paths = np.asarray(forecast["paths"], dtype=float)

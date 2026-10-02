@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
+import pickle
 import re
 from typing import Any, Dict, Iterable, Iterator, Mapping, Optional, Sequence
 
@@ -682,6 +683,99 @@ def prior_table(prior: Mapping[str, Any], variable_names: Sequence[str]) -> pd.D
     return pd.DataFrame(rows)
 
 
+
+def build_prior_from_config(
+    Y0: np.ndarray,
+    shortYt: np.ndarray,
+    model: str | BVARConfig = "BVAR-CSV-t-MA",
+    **overrides: Any,
+) -> Dict[str, Any]:
+    """Construct the coefficient/covariance prior implied by a model preset.
+
+    This is the notebook-facing prior API.  It centralizes the model dispatch so
+    callers do not need to branch manually between Minnesota-style and
+    natural-conjugate priors.  IP and SSVS intentionally use the Minnesota
+    coefficient-variance construction as their base prior, exactly as in the
+    supplied Chan MATLAB code; their unrestricted covariance and SSVS mixture
+    updates remain part of the posterior sampler.
+    """
+    config = get_model_config(model, **overrides)
+
+    if config.prior == "ncp":
+        prior = prior_natural_conjugate(
+            Y0,
+            shortYt,
+            p=config.p,
+            c1=config.c1,
+            c2=config.c2,
+        )
+    else:
+        prior = prior_minnesota(
+            Y0,
+            shortYt,
+            p=config.p,
+            c1=config.c1,
+            c2=config.c2,
+            c3=config.c3,
+        )
+
+    out = dict(prior)
+    out["model_name"] = config.name
+    out["config"] = config
+    out["prior_family"] = config.prior
+    if config.prior == "ssvs":
+        out["q"] = config.q
+        out["kappa1"] = config.kappa1
+    return out
+
+
+def prior_summary(prior: Mapping[str, Any]) -> pd.DataFrame:
+    """Compact human-readable summary of a prior built from a model config."""
+    config = prior.get("config")
+    if config is None:
+        raise ValueError(
+            "prior_summary expects a prior returned by build_prior_from_config()."
+        )
+
+    sig2 = np.asarray(prior["sig2"], dtype=float)
+    if config.prior == "ncp":
+        coefficient_prior = "matrix-normal / natural conjugate"
+        covariance_prior = f"IW(nu0={int(prior['nu0'])}, S0=diag(sig2))"
+    elif config.prior == "minnesota":
+        coefficient_prior = "Minnesota Gaussian"
+        covariance_prior = "fixed diagonal diag(sig2)"
+    elif config.prior == "ip":
+        coefficient_prior = "independent Minnesota-style Gaussian"
+        covariance_prior = f"IW(nu0={len(sig2) + 3}, S0=diag(sig2))"
+    elif config.prior == "ssvs":
+        coefficient_prior = (
+            "SSVS mixture: Minnesota spike / diffuse slab "
+            f"(q={config.q:g}, kappa1={config.kappa1:g})"
+        )
+        covariance_prior = f"IW(nu0={len(sig2) + 3}, S0=diag(sig2))"
+    else:  # guarded by validate_config; retained as a defensive fallback.
+        coefficient_prior = str(config.prior)
+        covariance_prior = "model-specific"
+
+    rows = [
+        ("model", config.name),
+        ("coefficient prior", coefficient_prior),
+        ("covariance treatment", covariance_prior),
+        ("variables", int(prior["n"])),
+        ("lags", int(prior["p"])),
+        ("c1", config.c1),
+        ("c2", config.c2),
+    ]
+    if config.prior != "ncp":
+        rows.append(("c3", config.c3))
+    rows.extend([
+        ("AR residual variance — min", float(np.min(sig2))),
+        ("AR residual variance — median", float(np.median(sig2))),
+        ("AR residual variance — max", float(np.max(sig2))),
+    ])
+    return pd.DataFrame(rows, columns=["parameter", "value"]).set_index("parameter")
+
+
 # =============================================================================
 # NUMERICAL HELPERS / LATENT-STATE SAMPLERS
 # =============================================================================
@@ -1074,6 +1168,10 @@ def _draw_joint_coefficients_cg(
     rng: np.random.Generator,
     rtol: float = 1e-10,
     maxiter: int = 5000,
+    *,
+    ZZ: Optional[np.ndarray] = None,
+    ZTY: Optional[np.ndarray] = None,
+    ZT: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Draw beta jointly from its Gaussian conditional without dense SUR matrices.
 
@@ -1081,63 +1179,147 @@ def _draw_joint_coefficients_cg(
 
         P = V^{-1} + Sigma^{-1} \\otimes (Z'Z)
 
-    and uses a sparse Cholesky factor.  SciPy does not ship a sparse Cholesky
-    factorization, so we use an equivalent *perturbation-optimization* draw:
-    construct a random right-hand side whose covariance is P, then solve the
-    same precision system with preconditioned conjugate gradients.  Up to the
-    numerical CG tolerance this is a joint draw from exactly the same Gaussian
-    conditional; it is not an equation-by-equation approximation.
+    and uses a sparse Cholesky factor. SciPy does not ship the same sparse
+    Cholesky routine, so the Python replication uses the equivalent
+    perturbation-optimization draw and solves P beta = rhs iteratively.
+
+    Numerical note
+    --------------
+    SSVS can make P strongly ill-conditioned because the latent gamma states
+    switch individual prior variances between the tight Minnesota component
+    and the diffuse slab. A purely diagonal preconditioner may then hit the
+    CG iteration cap even though P is symmetric positive definite.
+
+    The block-Jacobi preconditioner below uses the exact k x k principal block
+    for each VAR equation,
+
+        P_jj = diag(V_j^{-1}) + Omega_jj (Z'Z),
+
+    while leaving the target precision P itself unchanged. Therefore this is
+    a numerical-solver improvement only; the conditional Gaussian posterior
+    being sampled is unchanged.
     """
     Tt, k = Z.shape
     n = shortYt.shape[1]
-    ZZ = Z.T @ Z
-    ZTY = Z.T @ shortYt
+
+    # Z is fixed within one recursive origin.  Reuse these products across
+    # Gibbs draws when supplied by the caller; this changes no posterior math.
+    if ZT is None:
+        ZT = Z.T
+    if ZZ is None:
+        ZZ = ZT @ Z
+        ZZ = 0.5 * (ZZ + ZZ.T)
+    if ZTY is None:
+        ZTY = ZT @ shortYt
+
     Omega = np.linalg.inv(Sig)
+    Omega = 0.5 * (Omega + Omega.T)
+
+    prior_variance = np.asarray(prior_variance, dtype=float)
+    if prior_variance.shape != (k, n):
+        raise ValueError(
+            f"prior_variance must have shape {(k, n)}, got {prior_variance.shape}."
+        )
+    if np.any(~np.isfinite(prior_variance)) or np.any(prior_variance <= 0):
+        raise ValueError("prior_variance must be finite and strictly positive.")
+
     prior_prec = 1.0 / prior_variance
 
-    # Posterior mean right-hand side in k x n matrix form.
+    # Posterior-mean right-hand side in k x n matrix form.
     rhs_mean = prior_prec * beta0 + ZTY @ Omega
 
     # Random perturbation with covariance P.
-    # prior component: Cov(vec(sqrt(D) z)) = D
+    # prior component: Cov(vec(sqrt(D) z)) = D, D = V^{-1}
     prior_noise = np.sqrt(prior_prec) * rng.standard_normal((k, n))
+
     # likelihood component: if C'C = Omega then
-    # Cov(vec(Z' E C)) = Omega \otimes Z'Z.
+    # Cov(vec(Z' E C)) = Omega \\otimes Z'Z.
     L_omega = _safe_cholesky(Omega)
     C = L_omega.T
-    likelihood_noise = Z.T @ rng.standard_normal((Tt, n)) @ C
+    likelihood_noise = ZT @ rng.standard_normal((Tt, n)) @ C
     rhs = rhs_mean + prior_noise + likelihood_noise
 
     size = k * n
+    rhs_vec = rhs.reshape(size, order="F")
 
     def matvec(v: np.ndarray) -> np.ndarray:
-        B = np.asarray(v).reshape((k, n), order="F")
+        B = np.asarray(v, dtype=float).reshape((k, n), order="F")
         PB = prior_prec * B + ZZ @ B @ Omega
         return PB.reshape(size, order="F")
 
-    operator = sparse_linalg.LinearOperator((size, size), matvec=matvec, dtype=float)
+    operator = sparse_linalg.LinearOperator(
+        (size, size), matvec=matvec, rmatvec=matvec, dtype=float
+    )
 
-    # Diagonal preconditioner of the full precision.
-    diagP = prior_prec + np.diag(ZZ)[:, None] * np.diag(Omega)[None, :]
-    inv_diag = 1.0 / diagP.reshape(size, order="F")
+    # Strong block-Jacobi preconditioner. The previous diagonal-only
+    # preconditioner ignored within-equation Z'Z correlation and was too weak
+    # for some SSVS gamma configurations.
+    block_chol = []
+    for j in range(n):
+        block = np.diag(prior_prec[:, j]) + Omega[j, j] * ZZ
+        block = 0.5 * (block + block.T)
+        block_chol.append(_safe_cholesky(block))
+
+    def psolve(v: np.ndarray) -> np.ndarray:
+        Vmat = np.asarray(v, dtype=float).reshape((k, n), order="F")
+        out = np.empty_like(Vmat)
+        for j, L in enumerate(block_chol):
+            # Solve L L' x = v for the j-th equation block.
+            y = linalg.solve_triangular(
+                L, Vmat[:, j], lower=True, check_finite=False
+            )
+            out[:, j] = linalg.solve_triangular(
+                L.T, y, lower=False, check_finite=False
+            )
+        return out.reshape(size, order="F")
+
     preconditioner = sparse_linalg.LinearOperator(
-        (size, size), matvec=lambda v: inv_diag * v, dtype=float
+        (size, size), matvec=psolve, rmatvec=psolve, dtype=float
     )
 
     draw_vec, info = sparse_linalg.cg(
         operator,
-        rhs.reshape(size, order="F"),
+        rhs_vec,
         M=preconditioner,
         rtol=rtol,
         atol=0.0,
         maxiter=maxiter,
     )
-    if info != 0:
-        raise RuntimeError(
-            f"Joint coefficient CG solve did not converge (info={info})."
-        )
-    return draw_vec.reshape((k, n), order="F")
 
+    # CG should normally converge with the block preconditioner. If it hits
+    # the cap, MINRES is a robust second solver for the same symmetric system.
+    # No new random numbers are generated, so the target draw is unchanged.
+    if info != 0:
+        draw_vec, info_minres = sparse_linalg.minres(
+            operator,
+            rhs_vec,
+            x0=draw_vec,
+            M=preconditioner,
+            rtol=max(rtol, 1e-9),
+            maxiter=max(2 * maxiter, 10000),
+            check=False,
+        )
+        if info_minres != 0:
+            rel_resid = np.linalg.norm(matvec(draw_vec) - rhs_vec) / max(
+                np.linalg.norm(rhs_vec), 1.0
+            )
+            raise RuntimeError(
+                "Joint coefficient solve did not converge after block-"
+                f"preconditioned CG and MINRES (cg_info={info}, "
+                f"minres_info={info_minres}, rel_resid={rel_resid:.3e})."
+            )
+
+    # Explicit residual guard: solver success codes are not accepted blindly.
+    rel_resid = np.linalg.norm(matvec(draw_vec) - rhs_vec) / max(
+        np.linalg.norm(rhs_vec), 1.0
+    )
+    if not np.isfinite(rel_resid) or rel_resid > 1e-7:
+        raise RuntimeError(
+            "Joint coefficient solve returned an inaccurate solution "
+            f"(relative residual={rel_resid:.3e})."
+        )
+
+    return draw_vec.reshape((k, n), order="F")
 
 def _iter_ip_ssvs_draws(
     Y0: np.ndarray,
@@ -1152,6 +1334,10 @@ def _iter_ip_ssvs_draws(
     Tt, n = shortYt.shape
     k = 1 + n * p
     Z = build_var_design(Y0, shortYt, p)
+    ZT = Z.T
+    ZZ = ZT @ Z
+    ZZ = 0.5 * (ZZ + ZZ.T)
+    ZTY = ZT @ shortYt
 
     minn = prior_minnesota(Y0, shortYt, p, config.c1, config.c2, config.c3)
     beta0 = minn["mean"].reshape((k, n), order="F")
@@ -1171,7 +1357,9 @@ def _iter_ip_ssvs_draws(
 
         # Joint Gaussian draw: same conditional posterior as the SUR-Cholesky
         # draw in forecast_BVAR_IP.m / forecast_BVAR_SSVS.m.
-        A = _draw_joint_coefficients_cg(Z, shortYt, Sig, beta0, V, rng)
+        A = _draw_joint_coefficients_cg(
+            Z, shortYt, Sig, beta0, V, rng, ZZ=ZZ, ZTY=ZTY, ZT=ZT
+        )
 
         U = shortYt - Z @ A
         Sig = _draw_inverse_wishart(S0 + U.T @ U, nu0 + Tt, rng)
@@ -1919,6 +2107,211 @@ def compare_result_tables(results: Sequence[Mapping[str, Any]]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _recursive_checkpoint_path(
+    checkpoint_dir: Path | str,
+    config: BVARConfig,
+    *,
+    T0: int,
+    T: int,
+    nsims: int,
+    burnin: int,
+    seed: int,
+) -> Path:
+    """Stable checkpoint path for one completed recursive model run."""
+    directory = Path(checkpoint_dir)
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", config.name)
+    return directory / (
+        f"{safe_name}_p{config.p}_T{T0}-{T}_"
+        f"n{nsims}_b{burnin}_s{seed}.pkl"
+    )
+
+
+def _load_recursive_checkpoint(path: Path, expected: Mapping[str, Any]):
+    """Load a checkpoint only when its run metadata matches exactly."""
+    if not path.exists():
+        return None
+    try:
+        with path.open("rb") as handle:
+            payload = pickle.load(handle)
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or "result" not in payload:
+        return None
+    meta = payload.get("meta", {})
+    if any(meta.get(key) != value for key, value in expected.items()):
+        return None
+    return payload["result"]
+
+
+def _save_recursive_checkpoint(path: Path, result: Mapping[str, Any], meta: Mapping[str, Any]):
+    """Atomically save one completed recursive model run."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("wb") as handle:
+        pickle.dump({"meta": dict(meta), "result": dict(result)}, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp.replace(path)
+
+
+def _recursive_comparison_outputs(
+    replications: Mapping[str, Mapping[str, Any]],
+    model_names: Sequence[str],
+) -> Dict[str, Any]:
+    """Build compact tables and data-driven comments for completed runs."""
+    comparison = compare_result_tables(list(replications.values()))
+    horizons = ["Nowcast", "1-quarter-ahead"]
+    tables: Dict[str, pd.DataFrame] = {}
+
+    for metric in ("RMSFE", "ALPL"):
+        for horizon in horizons:
+            table = (
+                comparison.loc[comparison["horizon"] == horizon]
+                .pivot(index="variable", columns="model", values=metric)
+                .reindex(columns=list(model_names))
+            )
+            tables[f"{metric} — {horizon}"] = table
+
+    best_rows = []
+    for variable in CORE_LABELS:
+        for horizon in horizons:
+            block = comparison.loc[
+                (comparison["variable"] == variable)
+                & (comparison["horizon"] == horizon)
+            ]
+            best_rmsfe = block.loc[block["RMSFE"].idxmin()]
+            best_alpl = block.loc[block["ALPL"].idxmax()]
+            best_rows.append({
+                "variable": variable,
+                "horizon": horizon,
+                "lowest RMSFE model": best_rmsfe["model"],
+                "lowest RMSFE": best_rmsfe["RMSFE"],
+                "highest ALPL model": best_alpl["model"],
+                "highest ALPL": best_alpl["ALPL"],
+            })
+    best = pd.DataFrame(best_rows).set_index(["variable", "horizon"])
+
+    rmsfe_wins = best["lowest RMSFE model"].value_counts()
+    alpl_wins = best["highest ALPL model"].value_counts()
+    n_tasks = len(best)
+
+    def leaders(counts: pd.Series):
+        top = int(counts.max())
+        return list(counts[counts == top].index), top
+
+    rmsfe_leaders, rmsfe_count = leaders(rmsfe_wins)
+    alpl_leaders, alpl_count = leaders(alpl_wins)
+
+    def names_text(names):
+        return names[0] if len(names) == 1 else " and ".join(names)
+
+    rname = names_text(rmsfe_leaders)
+    aname = names_text(alpl_leaders)
+    if rmsfe_count == n_tasks:
+        rmsfe_comment = f"{rname} records the lowest RMSFE in all {n_tasks} variable-horizon combinations."
+    else:
+        rmsfe_comment = (
+            f"{rname} records the lowest RMSFE in the largest number of variable-horizon "
+            f"combinations ({rmsfe_count}/{n_tasks}). Point-forecast performance remains "
+            "heterogeneous across targets and horizons."
+        )
+    if alpl_count == n_tasks:
+        alpl_comment = f"{aname} records the highest ALPL in all {n_tasks} variable-horizon combinations."
+    else:
+        alpl_comment = (
+            f"{aname} records the highest ALPL in the largest number of variable-horizon "
+            f"combinations ({alpl_count}/{n_tasks}). The density ranking is not necessarily "
+            "the same as the RMSFE ranking."
+        )
+
+    same_leaders = set(rmsfe_leaders) == set(alpl_leaders) and len(rmsfe_leaders) == 1
+    if same_leaders:
+        overall = (
+            f"{rname} accumulates the most wins under both RMSFE and ALPL, while performance "
+            "can still differ by variable and horizon."
+        )
+    else:
+        overall = (
+            f"{rname} leads the RMSFE win count, whereas {aname} leads the ALPL win count. "
+            "The preferred specification therefore depends on the target and forecasting criterion."
+        )
+
+    return {
+        "comparison": comparison,
+        "tables": tables,
+        "best_by_task": best,
+        "comments": [rmsfe_comment, alpl_comment, overall],
+    }
+
+
+def run_large_bvar_suite(
+    rt_data,
+    nonrev_data,
+    tcode,
+    var_type,
+    *,
+    models: Optional[Sequence[str | BVARConfig]] = None,
+    p: Optional[int] = None,
+    T0: int = 41,
+    T: int = 208,
+    nsims: int = 500,
+    burnin: int = 100,
+    seed: int = 0,
+    checkpoint_dir: Optional[Path | str] = None,
+    progress: bool = True,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """Run all requested recursive BVARs with per-model resume checkpoints.
+
+    The sampler and forecasting equations are unchanged.  ``nsims`` is a
+    separate Monte Carlo budget for the historical exercise so the notebook
+    can keep a longer chain for the final-origin estimates.
+    """
+    selected = list(models if models is not None else MODEL_PRESETS)
+    replications: Dict[str, Mapping[str, Any]] = {}
+
+    for number, model in enumerate(selected, start=1):
+        config = get_model_config(model)
+        if p is not None:
+            config = replace(config, p=p)
+            validate_config(config)
+        print(f"\
+[{number}/{len(selected)}] Full recursive replication — {config.name}")
+
+        meta = {
+            "model_name": config.name, "p": config.p, "T0": T0, "T": T,
+            "nsims": nsims, "burnin": burnin, "seed": seed,
+            "n": len(var_type),
+        }
+        result = None
+        checkpoint = None
+        if checkpoint_dir is not None:
+            checkpoint = _recursive_checkpoint_path(
+                checkpoint_dir, config, T0=T0, T=T, nsims=nsims, burnin=burnin, seed=seed
+            )
+            if not force:
+                result = _load_recursive_checkpoint(checkpoint, meta)
+                if result is not None:
+                    print(f"Loaded checkpoint: {checkpoint.name}")
+
+        if result is None:
+            result = run_large_bvar(
+                rt_data, nonrev_data, tcode, var_type, model=config, p=config.p,
+                T0=T0, T=T, nsims=nsims, burnin=burnin, seed=seed, progress=progress,
+            )
+            if checkpoint is not None:
+                _save_recursive_checkpoint(checkpoint, result, meta)
+                print(f"Saved checkpoint: {checkpoint.name}")
+
+        replications[config.name] = result
+
+    outputs = _recursive_comparison_outputs(replications, [get_model_config(m).name for m in selected])
+    outputs["replications"] = replications
+    outputs["settings"] = {
+        "nsims": nsims, "burnin": burnin, "T0": T0, "T": T, "seed": seed,
+        "checkpoint_dir": None if checkpoint_dir is None else str(checkpoint_dir),
+    }
+    return outputs
+
+
 # =============================================================================
 # LEGACY BVAR-SMALL API (kept so the previous notebook/imports do not break)
 # =============================================================================
@@ -2022,7 +2415,7 @@ def forecast_origin_from_fit(
     T: int,
     seed: int = 123,
 ):
-    """Chan-style nowcast / one-quarter predictive output from stored draws.
+    """Low-level stored-draw origin forecast helper. Prefer :func:`forecast_bvar`.
 
     Unlike :func:`forecast_bvar_origin`, this function does not rerun the
     sampler.  It evaluates the predictive distribution using the exact draws
@@ -2084,7 +2477,7 @@ def forecast_paths_from_fit(
     seed: int = 123,
     is_last_miss: bool = False,
 ) -> Dict[str, Any]:
-    """Simulate posterior predictive paths from an already estimated fit.
+    """Low-level predictive-path helper. Prefer :func:`forecast_bvar` in notebooks.
 
     This reuses the retained parameter draws, so the fan chart does not rerun
     the Gibbs/MH sampler.  CSV volatility, Student-t tails and the MA(1)
@@ -2170,6 +2563,122 @@ def forecast_paths_from_fit(
         "is_last_miss": bool(is_last_miss),
     }
 
+
+
+
+def forecast_bvar(
+    fit: Mapping[str, Any],
+    sample: Mapping[str, Any],
+    *,
+    horizon: int = 12,
+    seed: int = 0,
+    t: Optional[int] = None,
+    T: Optional[int] = None,
+    origin_seed: Optional[int] = None,
+    fan_seed: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Notebook-facing forecast API for an already estimated BVAR.
+
+    The function deliberately separates *forecasting from one fitted origin*
+    from Chan's expensive real-time recursive re-estimation exercise.  It uses
+    the posterior draws already stored by ``fit_bvar(..., store_structural=True)``
+    to produce, in one call:
+
+    * the Chan-style nowcast table and joint log predictive likelihood;
+    * the one-quarter-ahead evaluation table when Chan's historical guard makes
+      that target valid at the requested origin;
+    * an H-step posterior predictive fan.
+
+    ``run_large_bvar`` remains the separate API for the full vintage-by-vintage
+    refit-and-forecast exercise.
+    """
+    required = {"shortYt", "targets", "is_last_miss"}
+    missing = sorted(required.difference(sample))
+    if missing:
+        raise KeyError(f"sample is missing required fields: {missing}")
+
+    shortYt = np.asarray(sample["shortYt"], dtype=float)
+    targets = np.asarray(sample["targets"], dtype=float)
+    is_last_miss = bool(sample["is_last_miss"])
+    n = int(fit["n"])
+    if shortYt.shape[1] != n:
+        raise ValueError("sample and fit do not contain the same number of variables.")
+    if targets.ndim != 2 or targets.shape[1] != n or targets.shape[0] < 2:
+        raise ValueError("sample['targets'] must have at least two rows and n columns.")
+
+    names = list(fit.get("variables", []))
+    if len(names) != n:
+        names = [f"var{i + 1}" for i in range(n)]
+
+    origin_t = int(sample.get("t", 0) if t is None else t)
+    if origin_t <= 0:
+        raise ValueError("A positive forecast-origin index t is required.")
+    terminal_T = int(origin_t if T is None else T)
+    if terminal_T < origin_t:
+        raise ValueError("T must be greater than or equal to t.")
+
+    if origin_seed is None:
+        origin_seed = int(seed) + 100
+    if fan_seed is None:
+        fan_seed = int(seed) + 200
+
+    tmp0, tmp1 = forecast_origin_from_fit(
+        fit,
+        shortYt,
+        targets,
+        is_last_miss,
+        t=origin_t,
+        T=terminal_T,
+        seed=origin_seed,
+    )
+    point0, lpl0 = aggregate_forecast_draws(tmp0, n=n)
+    nowcast = pd.DataFrame(
+        {
+            "actual": targets[0],
+            "posterior mean forecast": point0,
+            "log predictive likelihood": lpl0[:-1],
+        },
+        index=names,
+    )
+
+    # Exact tt=2 guard inherited from Chan's supplied MATLAB forecast scripts.
+    one_quarter_valid = origin_t <= terminal_T - 2
+    one_quarter = None
+    one_quarter_joint_lpl = np.nan
+    if one_quarter_valid:
+        point1, lpl1 = aggregate_forecast_draws(tmp1, n=n)
+        one_quarter = pd.DataFrame(
+            {
+                "actual": targets[1],
+                "posterior mean forecast": point1,
+                "log predictive likelihood": lpl1[:-1],
+            },
+            index=names,
+        )
+        one_quarter_joint_lpl = float(lpl1[-1])
+
+    fan = forecast_paths_from_fit(
+        fit,
+        shortYt,
+        H=horizon,
+        seed=fan_seed,
+        is_last_miss=is_last_miss,
+    )
+
+    return {
+        "model_name": fit["model_name"],
+        "nowcast": nowcast,
+        "table": nowcast,  # concise default table for notebook display
+        "one_quarter_ahead": one_quarter,
+        "joint_lpl": float(lpl0[-1]),
+        "one_quarter_ahead_joint_lpl": one_quarter_joint_lpl,
+        "one_quarter_ahead_available": bool(one_quarter_valid),
+        "fan": fan,
+        "horizon": int(horizon),
+        "origin_t": origin_t,
+        "terminal_T": terminal_T,
+        "seeds": {"origin": int(origin_seed), "fan": int(fan_seed)},
+    }
 
 
 # =============================================================================
